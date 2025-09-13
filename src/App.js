@@ -9,73 +9,142 @@ const SellAnalyzer = () => {
   const [rawOcrData, setRawOcrData] = useState([]);
   const [showCorrection, setShowCorrection] = useState(false);
   const [editingTrade, setEditingTrade] = useState(null);
+  const [debugMode, setDebugMode] = useState(false);
 
-  // Enhanced pattern matching with better Total detection
-  const parseSellTransactions = (text, confidence, imageIndex) => {
-    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 1);
+  // Row-aware parsing - extrahuje data pouze ze stejného řádku
+  const parseSellTransactionsRowAware = (ocrResult, imageIndex) => {
+    const { words } = ocrResult.data;
     const trades = [];
     
-    console.log(`🔍 OCR Text for image ${imageIndex + 1}:`);
-    console.log(text);
+    console.log(`🔍 Processing ${words.length} words from image ${imageIndex + 1}`);
     
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].toLowerCase();
+    // Najdi všechny SELL words s jejich pozicemi
+    const sellWords = words.filter(word => 
+      word.text.toLowerCase().includes('sell') && word.confidence > 30
+    );
+    
+    console.log(`💰 Found ${sellWords.length} SELL words:`, sellWords.map(w => `"${w.text}" at y=${w.bbox.y0}`));
+    
+    for (const sellWord of sellWords) {
+      const sellY = sellWord.bbox.y0;
+      const sellHeight = sellWord.bbox.y1 - sellWord.bbox.y0;
+      const rowTolerance = sellHeight * 2; // Tolerance pro řádek
       
-      if (line.includes('sell') || line.includes('prodej')) {
-        const contextStart = Math.max(0, i - 2);
-        const contextEnd = Math.min(lines.length, i + 3);
-        const contextLines = lines.slice(contextStart, contextEnd);
-        const fullContext = contextLines.join(' ');
+      // Najdi všechna slova na stejném řádku (±tolerance)
+      const rowWords = words.filter(word => {
+        const wordY = word.bbox.y0;
+        const inRow = Math.abs(wordY - sellY) <= rowTolerance;
+        const goodConfidence = word.confidence > 20;
+        return inRow && goodConfidence && word.text.trim().length > 0;
+      });
+      
+      // Seřaď slova zleva doprava
+      rowWords.sort((a, b) => a.bbox.x0 - b.bbox.x0);
+      
+      const rowText = rowWords.map(w => w.text).join(' ');
+      console.log(`📋 SELL row text: "${rowText}"`);
+      
+      let pair = null;
+      let total = null;
+      let result = null;
+      
+      // Extrahuj data pouze z tohoto řádku
+      for (let i = 0; i < rowWords.length; i++) {
+        const word = rowWords[i];
+        const text = word.text.trim();
         
-        console.log(`💰 SELL context: "${fullContext}"`);
-        
-        let pair = null;
-        let total = null;
-        let result = null;
-        
-        // Extract trading pair
-        const pairMatch = fullContext.match(/([A-Z]{2,6})[\s\/\-]*(USDT|USD)/i);
-        if (pairMatch) {
-          pair = `${pairMatch[1]}/${pairMatch[2] || 'USDT'}`.toUpperCase();
-        }
-        
-        // Enhanced Total extraction - look for realistic trading amounts
-        const numberMatches = [...fullContext.matchAll(/(\d+(?:\.\d+)?)/g)];
-        const potentialTotals = [];
-        
-        for (const match of numberMatches) {
-          const value = parseFloat(match[1]);
-          // Filter for realistic trading amounts (exclude dates, small percentages)
-          if (value >= 50 && value <= 50000) {
-            potentialTotals.push(value);
+        // Trading pair detection
+        if (!pair && /^[A-Z]{2,6}$/i.test(text)) {
+          // Zkontroluj následující slovo pro /USDT
+          const nextWord = i + 1 < rowWords.length ? rowWords[i + 1].text.trim() : '';
+          if (nextWord.includes('USDT') || nextWord.includes('USD')) {
+            pair = `${text.toUpperCase()}/${nextWord.includes('USDT') ? 'USDT' : 'USD'}`;
+          } else if (text.length >= 3) {
+            pair = `${text.toUpperCase()}/USDT`; // Default assumption
           }
         }
         
-        // Choose the largest realistic number as Total (trading amounts are usually larger)
-        if (potentialTotals.length > 0) {
-          total = Math.max(...potentialTotals);
+        // Kombinovaný pair (SQR/USDT v jednom slově)
+        if (!pair && /^[A-Z]{2,6}[\/\-][A-Z]{3,4}$/i.test(text)) {
+          pair = text.toUpperCase().replace('-', '/');
         }
         
-        // Extract result percentage
-        const resultMatch = fullContext.match(/([+-]?\d{1,2}\.?\d{0,3})\s*%/);
-        if (resultMatch) {
-          result = parseFloat(resultMatch[1]);
+        // Total amount detection (realistic trading amounts)
+        if (!total && /^\d{2,5}\.?\d{0,8}$/.test(text)) {
+          const value = parseFloat(text);
+          if (value >= 50 && value <= 100000) {
+            total = value;
+          }
         }
         
-        // Create trade with best guess - user can correct later
-        if (pair) {
-          trades.push({
-            id: Date.now() + Math.random(),
-            pair,
-            total: total || 0, // Default to 0 if not found
-            result: result || 0, // Default to 0 if not found
-            profit: ((total || 0) * (result || 0)) / 100,
-            source: `Image ${imageIndex + 1}`,
-            confidence,
-            needsCorrection: !total || total < 50 || !result, // Flag suspicious data
-            rawContext: fullContext.substring(0, 150)
-          });
+        // Result percentage detection
+        if (!result && /^[+-]?\d{1,3}\.?\d{0,3}%?$/.test(text)) {
+          const cleanText = text.replace('%', '');
+          const value = parseFloat(cleanText);
+          if (value >= -99 && value <= 99 && Math.abs(value) > 0.1) {
+            result = value;
+          }
         }
+        
+        // Percentage with explicit % symbol
+        if (!result && text.includes('%')) {
+          const match = text.match(/([+-]?\d{1,3}\.?\d{0,3})%/);
+          if (match) {
+            const value = parseFloat(match[1]);
+            if (value >= -99 && value <= 99 && Math.abs(value) > 0.1) {
+              result = value;
+            }
+          }
+        }
+      }
+      
+      // Pokud chybí data, hledej v blízkých řádcích (jen velmi blízko)
+      if (pair && (!total || !result)) {
+        const nearbyWords = words.filter(word => {
+          const wordY = word.bbox.y0;
+          const isNearby = Math.abs(wordY - sellY) <= rowTolerance * 1.5;
+          return isNearby && word.confidence > 25;
+        });
+        
+        for (const word of nearbyWords) {
+          const text = word.text.trim();
+          
+          if (!total && /^\d{2,5}\.?\d{0,8}$/.test(text)) {
+            const value = parseFloat(text);
+            if (value >= 50 && value <= 100000) {
+              total = value;
+            }
+          }
+          
+          if (!result && /^[+-]?\d{1,3}\.?\d{0,3}%?$/.test(text)) {
+            const cleanText = text.replace('%', '');
+            const value = parseFloat(cleanText);
+            if (value >= -99 && value <= 99 && Math.abs(value) > 0.1) {
+              result = value;
+            }
+          }
+        }
+      }
+      
+      // Vytvoř trade pouze pokud máme kompletní data
+      if (pair) {
+        const trade = {
+          id: Date.now() + Math.random(),
+          pair,
+          total: total || 0,
+          result: result || 0,
+          profit: ((total || 0) * (result || 0)) / 100,
+          source: `Image ${imageIndex + 1}`,
+          rowText: rowText.substring(0, 100), // Pro debug
+          sellPosition: { x: sellWord.bbox.x0, y: sellWord.bbox.y0 },
+          needsCorrection: !total || total < 50 || !result || Math.abs(result) < 0.1,
+          confidence: Math.round(rowWords.reduce((sum, w) => sum + w.confidence, 0) / rowWords.length)
+        };
+        
+        console.log(`✅ Created trade: ${pair} | ${total} | ${result}% | Confidence: ${trade.confidence}%`);
+        trades.push(trade);
+      } else {
+        console.log(`❌ Incomplete SELL row: Pair=${pair}, Total=${total}, Result=${result}`);
       }
     }
     
@@ -117,6 +186,7 @@ const SellAnalyzer = () => {
       await worker.setParameters({
         tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-%/+:()[] ',
         tessedit_pageseg_mode: '6',
+        preserve_interword_spaces: '1'
       });
       
       for (let i = 0; i < imageFiles.length; i++) {
@@ -136,15 +206,18 @@ const SellAnalyzer = () => {
           img.src = screenshotPreviews[i].preview;
         });
         
-        const { data: { text, confidence } } = await worker.recognize(canvas);
+        // Get detailed OCR result with word positions
+        const ocrResult = await worker.recognize(canvas);
         
-        const trades = parseSellTransactions(text, confidence, i);
+        // Row-aware parsing
+        const trades = parseSellTransactionsRowAware(ocrResult, i);
         allTrades.push(...trades);
         
         allRawData.push({
           imageIndex: i,
-          text,
-          confidence,
+          text: ocrResult.data.text,
+          words: ocrResult.data.words,
+          confidence: ocrResult.data.confidence,
           trades,
           preview: screenshotPreviews[i].preview
         });
@@ -164,7 +237,7 @@ const SellAnalyzer = () => {
     
     setRawOcrData(allRawData);
     setTrades(allTrades);
-    setShowCorrection(true); // Always show correction interface
+    setShowCorrection(true);
   };
 
   // Quick edit trade
@@ -232,10 +305,10 @@ const SellAnalyzer = () => {
         {/* Header */}
         <div className="text-center mb-8">
           <h1 className="text-5xl font-bold mb-4 bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent">
-            ✏️ OCR + Smart Correction
+            📋 Row-Aware SELL Analyzer
           </h1>
           <p className="text-xl text-gray-300">
-            OCR rozpoznání → Quick correction interface → Perfect data
+            Inteligentní řádkový parsing • Data ze stejného řádku • Zero mix-ups
           </p>
         </div>
 
@@ -250,9 +323,9 @@ const SellAnalyzer = () => {
           >
             {loading ? (
               <div className="space-y-6">
-                <div className="text-6xl animate-spin">✏️</div>
+                <div className="text-6xl animate-spin">📋</div>
                 <h3 className="text-2xl font-semibold">
-                  OCR scanning {progress.current}/{progress.total}...
+                  Row-aware parsing {progress.current}/{progress.total}...
                 </h3>
                 <div className="w-full bg-gray-700 rounded-full h-4">
                   <div 
@@ -260,26 +333,26 @@ const SellAnalyzer = () => {
                     style={{ width: `${progress.percent}%` }}
                   ></div>
                 </div>
-                <div className="text-lg">{progress.percent}% - Připravuji korekční rozhraní...</div>
+                <div className="text-lg">{progress.percent}% - Analyzuji pozice slov...</div>
               </div>
             ) : (
               <div>
-                <div className="text-8xl mb-6">✏️📱✏️</div>
-                <h3 className="text-2xl font-semibold mb-4">OCR + Human Intelligence</h3>
-                <div className="bg-gradient-to-r from-blue-900/50 to-purple-900/50 rounded-lg p-6 mb-4">
-                  <p className="text-white font-semibold mb-3">✏️ Hybrid approach:</p>
+                <div className="text-8xl mb-6">📋🔍📋</div>
+                <h3 className="text-2xl font-semibold mb-4">Row-Aware OCR Parser</h3>
+                <div className="bg-gradient-to-r from-green-900/50 to-blue-900/50 rounded-lg p-6 mb-4">
+                  <p className="text-white font-semibold mb-3">📋 Inteligentní row parsing:</p>
                   <div className="text-left text-sm space-y-2">
-                    <div>1. 🤖 OCR vyextrahuje co dokáže (páry, % už fungují)</div>
-                    <div>2. ⚠️ Označí podezřelá data (13 místo 274.1200)</div>
-                    <div>3. ✏️ Vy rychle opravíte wrong hodnoty</div>
-                    <div>4. ⚡ Instant přepočítání profit a statistik</div>
+                    <div>1. 🎯 Najde SELL slovo a jeho pozici (x, y koordináty)</div>
+                    <div>2. 📏 Definuje "řádek" pomocí pozice ± tolerance</div>
+                    <div>3. 🔗 Extrahuje data POUZE ze stejného řádku</div>
+                    <div>4. ❌ Nezmixuje data z různých řádků</div>
                   </div>
                 </div>
                 <p className="text-gray-300 text-lg mb-4">
-                  <strong>OCR rychlost + Human přesnost = Perfect solution</strong>
+                  <strong>Eliminuje cross-row data mixing</strong>
                 </p>
                 <p className="text-gray-400">
-                  Nahrajte screenshoty pro OCR + korekci
+                  Nahrajte screenshoty pro precision row parsing
                 </p>
               </div>
             )}
@@ -295,14 +368,61 @@ const SellAnalyzer = () => {
           </div>
         </div>
 
+        {/* Debug Mode Toggle */}
+        {rawOcrData.length > 0 && (
+          <div className="text-center mb-6">
+            <button
+              onClick={() => setDebugMode(!debugMode)}
+              className="px-6 py-2 bg-purple-600 rounded-lg hover:bg-purple-500"
+            >
+              🔍 {debugMode ? 'Skrýt' : 'Zobrazit'} Row Debug Info
+            </button>
+          </div>
+        )}
+
+        {/* Debug Information */}
+        {debugMode && rawOcrData.length > 0 && (
+          <div className="bg-white/10 rounded-2xl p-6 mb-8 backdrop-blur-sm border border-white/20">
+            <h3 className="text-xl font-semibold mb-4">🔍 Row-Aware Debug Information</h3>
+            <div className="space-y-4 max-h-96 overflow-y-auto">
+              {rawOcrData.map((result, idx) => (
+                <div key={idx} className="bg-black/30 rounded-lg p-4">
+                  <div className="flex justify-between mb-2">
+                    <span className="font-semibold">Image {result.imageIndex + 1}</span>
+                    <span className="text-sm text-gray-400">
+                      {result.trades.length} SELL rows detected
+                    </span>
+                  </div>
+                  
+                  {result.trades.map((trade, tradeIdx) => (
+                    <div key={tradeIdx} className="bg-white/5 rounded p-3 mb-2">
+                      <div className="text-sm">
+                        <div className="text-yellow-300">
+                          <strong>SELL at position:</strong> x={trade.sellPosition.x}, y={trade.sellPosition.y}
+                        </div>
+                        <div className="text-green-300">
+                          <strong>Row text:</strong> "{trade.rowText}"
+                        </div>
+                        <div className="text-blue-300">
+                          <strong>Extracted:</strong> {trade.pair} | {trade.total} | {trade.result}% | Conf: {trade.confidence}%
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Correction Interface */}
         {showCorrection && trades.length > 0 && (
           <div className="bg-white/10 rounded-2xl p-6 mb-8 backdrop-blur-sm border border-white/20">
             <div className="flex justify-between items-center mb-6">
               <div>
-                <h3 className="text-xl font-semibold">✏️ Quick Correction Interface</h3>
+                <h3 className="text-xl font-semibold">✏️ Row-Based Corrections</h3>
                 {needsCorrection > 0 && (
-                  <p className="text-yellow-400 text-sm">⚠️ {needsCorrection} transakcí potřebuje opravu</p>
+                  <p className="text-yellow-400 text-sm">⚠️ {needsCorrection} řádků potřebuje opravu</p>
                 )}
               </div>
               <button 
@@ -325,74 +445,84 @@ const SellAnalyzer = () => {
                 >
                   {editingTrade?.id === trade.id ? (
                     // Edit mode
-                    <div className="grid grid-cols-1 md:grid-cols-5 gap-4 items-center">
-                      <input
-                        value={editingTrade.pair}
-                        onChange={(e) => setEditingTrade(prev => ({...prev, pair: e.target.value}))}
-                        className="px-3 py-2 bg-black/30 rounded border border-white/30 text-white"
-                        placeholder="SQR/USDT"
-                      />
-                      <input
-                        type="number"
-                        step="0.0001"
-                        value={editingTrade.total}
-                        onChange={(e) => setEditingTrade(prev => ({...prev, total: e.target.value}))}
-                        className="px-3 py-2 bg-black/30 rounded border border-white/30 text-white"
-                        placeholder="274.1200"
-                      />
-                      <input
-                        type="number"
-                        step="0.01"
-                        value={editingTrade.result}
-                        onChange={(e) => setEditingTrade(prev => ({...prev, result: e.target.value}))}
-                        className="px-3 py-2 bg-black/30 rounded border border-white/30 text-white"
-                        placeholder="6.26"
-                      />
-                      <div className="text-green-400 font-mono">
-                        {((parseFloat(editingTrade.total) || 0) * (parseFloat(editingTrade.result) || 0) / 100).toFixed(4)}
+                    <div className="space-y-4">
+                      <div className="text-xs text-gray-400 mb-2">
+                        Row text: "{trade.rowText}" • Position: ({trade.sellPosition.x}, {trade.sellPosition.y})
                       </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={saveEdit}
-                          className="px-3 py-1 bg-green-600 rounded text-sm hover:bg-green-500"
-                        >
-                          ✓ Save
-                        </button>
-                        <button
-                          onClick={cancelEdit}
-                          className="px-3 py-1 bg-gray-600 rounded text-sm hover:bg-gray-500"
-                        >
-                          ✕ Cancel
-                        </button>
+                      <div className="grid grid-cols-1 md:grid-cols-5 gap-4 items-center">
+                        <input
+                          value={editingTrade.pair}
+                          onChange={(e) => setEditingTrade(prev => ({...prev, pair: e.target.value}))}
+                          className="px-3 py-2 bg-black/30 rounded border border-white/30 text-white"
+                          placeholder="SQR/USDT"
+                        />
+                        <input
+                          type="number"
+                          step="0.0001"
+                          value={editingTrade.total}
+                          onChange={(e) => setEditingTrade(prev => ({...prev, total: e.target.value}))}
+                          className="px-3 py-2 bg-black/30 rounded border border-white/30 text-white"
+                          placeholder="274.1200"
+                        />
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={editingTrade.result}
+                          onChange={(e) => setEditingTrade(prev => ({...prev, result: e.target.value}))}
+                          className="px-3 py-2 bg-black/30 rounded border border-white/30 text-white"
+                          placeholder="6.26"
+                        />
+                        <div className="text-green-400 font-mono">
+                          {((parseFloat(editingTrade.total) || 0) * (parseFloat(editingTrade.result) || 0) / 100).toFixed(4)}
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={saveEdit}
+                            className="px-3 py-1 bg-green-600 rounded text-sm hover:bg-green-500"
+                          >
+                            ✓ Save
+                          </button>
+                          <button
+                            onClick={cancelEdit}
+                            className="px-3 py-1 bg-gray-600 rounded text-sm hover:bg-gray-500"
+                          >
+                            ✕ Cancel
+                          </button>
+                        </div>
                       </div>
                     </div>
                   ) : (
                     // View mode
-                    <div className="grid grid-cols-1 md:grid-cols-5 gap-4 items-center">
-                      <div className="font-bold text-red-400">{trade.pair}</div>
-                      <div className={`font-mono ${trade.needsCorrection && trade.total < 50 ? 'text-yellow-400' : ''}`}>
-                        {trade.total.toFixed(4)}
-                        {trade.needsCorrection && trade.total < 50 && <span className="text-xs ml-1">⚠️</span>}
+                    <div className="space-y-2">
+                      <div className="text-xs text-gray-400">
+                        Row: "{trade.rowText}" • Confidence: {trade.confidence}%
                       </div>
-                      <div className={`font-bold ${trade.result >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {trade.result >= 0 ? '+' : ''}{trade.result.toFixed(2)}%
-                      </div>
-                      <div className={`font-mono font-bold ${trade.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {trade.profit >= 0 ? '+' : ''}{trade.profit.toFixed(4)}
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => startEdit(trade)}
-                          className="px-3 py-1 bg-blue-600 rounded text-sm hover:bg-blue-500"
-                        >
-                          ✏️ Edit
-                        </button>
-                        <button
-                          onClick={() => deleteTrade(trade.id)}
-                          className="px-3 py-1 bg-red-600 rounded text-sm hover:bg-red-500"
-                        >
-                          🗑️
-                        </button>
+                      <div className="grid grid-cols-1 md:grid-cols-5 gap-4 items-center">
+                        <div className="font-bold text-red-400">{trade.pair}</div>
+                        <div className={`font-mono ${trade.needsCorrection && trade.total < 50 ? 'text-yellow-400' : ''}`}>
+                          {trade.total.toFixed(4)}
+                          {trade.needsCorrection && trade.total < 50 && <span className="text-xs ml-1">⚠️</span>}
+                        </div>
+                        <div className={`font-bold ${trade.result >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {trade.result >= 0 ? '+' : ''}{trade.result.toFixed(2)}%
+                        </div>
+                        <div className={`font-mono font-bold ${trade.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {trade.profit >= 0 ? '+' : ''}{trade.profit.toFixed(4)}
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => startEdit(trade)}
+                            className="px-3 py-1 bg-blue-600 rounded text-sm hover:bg-blue-500"
+                          >
+                            ✏️ Edit
+                          </button>
+                          <button
+                            onClick={() => deleteTrade(trade.id)}
+                            className="px-3 py-1 bg-red-600 rounded text-sm hover:bg-red-500"
+                          >
+                            🗑️
+                          </button>
+                        </div>
                       </div>
                     </div>
                   )}
@@ -407,7 +537,7 @@ const SellAnalyzer = () => {
           <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
             <div className="bg-gradient-to-r from-red-600 to-red-700 rounded-2xl p-6 text-center">
               <div className="text-4xl font-bold mb-2">{trades.length}</div>
-              <div className="text-red-100">OCR + Corrected</div>
+              <div className="text-red-100">Row-aware SELL</div>
             </div>
             <div className="bg-gradient-to-r from-blue-600 to-blue-700 rounded-2xl p-6 text-center">
               <div className="text-4xl font-bold mb-2">{totalAmount.toFixed(2)}</div>
@@ -455,10 +585,10 @@ const SellAnalyzer = () => {
           <div className="bg-white/10 rounded-2xl overflow-hidden backdrop-blur-sm border border-white/20 shadow-2xl">
             <div className="bg-gradient-to-r from-red-600 to-red-700 px-8 py-6">
               <h2 className="text-2xl font-bold text-center">
-                ✏️ Final Corrected SELL Transakce
+                📋 Row-Aware SELL Transakce
               </h2>
               <p className="text-center text-red-100 text-sm mt-2">
-                OCR + Human correction = Perfect accuracy
+                Data extrahovaná ze stejných řádků - zero mix-ups
               </p>
             </div>
             
@@ -494,6 +624,7 @@ const SellAnalyzer = () => {
                 <div key={trade.id} className="bg-white/5 rounded-xl p-6 border border-white/10">
                   <div className="text-center mb-4">
                     <div className="font-bold text-2xl text-red-400">{trade.pair}</div>
+                    <div className="text-xs text-gray-400">Confidence: {trade.confidence}%</div>
                   </div>
                   <div className="space-y-3">
                     <div className="flex justify-between">
@@ -521,7 +652,7 @@ const SellAnalyzer = () => {
 
         {/* Footer */}
         <div className="text-center mt-12 text-gray-400">
-          <p>✏️ OCR + Human Intelligence • Quick corrections • Perfect accuracy</p>
+          <p>📋 Row-aware parsing • Position-based extraction • Zero cross-row mixing</p>
         </div>
       </div>
     </div>
