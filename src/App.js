@@ -1,145 +1,300 @@
-import React, { useState, useRef } from 'react';
+import React, { useState } from 'react';
+import { createWorker } from 'tesseract.js';
 
 const SellAnalyzer = () => {
   const [trades, setTrades] = useState([]);
   const [screenshots, setScreenshots] = useState([]);
-  const [currentScreenshot, setCurrentScreenshot] = useState(0);
-  const [manualEntry, setManualEntry] = useState({
-    pair: '',
-    total: '',
-    result: '',
-    isActive: false
-  });
-  const fileInputRef = useRef(null);
+  const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState({ current: 0, total: 0, percent: 0 });
+  const [processingLog, setProcessingLog] = useState([]);
 
-  // Handle multiple file upload
-  const handleFileUpload = (e) => {
+  // Advanced region detection for trading interface
+  const detectTradingRegions = async (canvas, ctx) => {
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+    const width = canvas.width;
+    const height = canvas.height;
+    
+    // Look for table-like structures and "Sell" text regions
+    const regions = [];
+    const sellPositions = [];
+    
+    // Convert to grayscale and find dark backgrounds (trading tables)
+    const grayscale = [];
+    for (let i = 0; i < data.length; i += 4) {
+      const gray = (data[i] + data[i + 1] + data[i + 2]) / 3;
+      grayscale.push(gray);
+    }
+    
+    // Find horizontal lines (table rows)
+    const horizontalLines = [];
+    for (let y = 10; y < height - 10; y += 5) {
+      let darkPixels = 0;
+      for (let x = 0; x < width; x += 10) {
+        const idx = y * width + x;
+        if (grayscale[idx] < 100) darkPixels++;
+      }
+      if (darkPixels > width / 20) {
+        horizontalLines.push(y);
+      }
+    }
+    
+    // Group lines into table rows (regions)
+    for (let i = 0; i < horizontalLines.length - 1; i++) {
+      const rowTop = horizontalLines[i];
+      const rowBottom = horizontalLines[i + 1];
+      const rowHeight = rowBottom - rowTop;
+      
+      if (rowHeight > 20 && rowHeight < 100) {
+        regions.push({
+          x: 0,
+          y: rowTop,
+          width: width,
+          height: rowHeight,
+          type: 'tableRow'
+        });
+      }
+    }
+    
+    return regions;
+  };
+
+  // Smart OCR with region focus
+  const processRegionWithOCR = async (canvas, region, worker) => {
+    const ctx = canvas.getContext('2d');
+    
+    // Create smaller canvas for the region
+    const regionCanvas = document.createElement('canvas');
+    const regionCtx = regionCanvas.getContext('2d');
+    regionCanvas.width = region.width;
+    regionCanvas.height = region.height;
+    
+    // Extract region
+    regionCtx.drawImage(canvas, region.x, region.y, region.width, region.height, 0, 0, region.width, region.height);
+    
+    // Enhance contrast for this region
+    const imageData = regionCtx.getImageData(0, 0, region.width, region.height);
+    const data = imageData.data;
+    
+    // High contrast enhancement specifically for text
+    for (let i = 0; i < data.length; i += 4) {
+      const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3;
+      if (brightness > 150) {
+        data[i] = 255; data[i + 1] = 255; data[i + 2] = 255; // White
+      } else if (brightness < 80) {
+        data[i] = 0; data[i + 1] = 0; data[i + 2] = 0; // Black
+      } else {
+        data[i] = brightness > 115 ? 255 : 0;
+        data[i + 1] = brightness > 115 ? 255 : 0;
+        data[i + 2] = brightness > 115 ? 255 : 0;
+      }
+    }
+    
+    regionCtx.putImageData(imageData, 0, 0);
+    
+    // OCR on enhanced region
+    const { data: { text, confidence } } = await worker.recognize(regionCanvas);
+    
+    return {
+      text: text.trim(),
+      confidence,
+      region,
+      processedImage: regionCanvas.toDataURL()
+    };
+  };
+
+  // Enhanced SELL detection with positional intelligence
+  const extractSellTransactions = async (regions, worker) => {
+    const trades = [];
+    
+    for (let region of regions) {
+      try {
+        const result = await processRegionWithOCR(document.createElement('canvas'), region, worker);
+        
+        // Check if this region contains SELL
+        if (result.text.toLowerCase().includes('sell')) {
+          console.log(`🎯 SELL region found: "${result.text}"`);
+          
+          // Split into columns based on spacing
+          const text = result.text.replace(/\s+/g, ' ').trim();
+          const parts = text.split(' ').filter(p => p.length > 0);
+          
+          console.log(`📊 Text parts:`, parts);
+          
+          // Intelligent pattern matching for columns
+          let pair = null;
+          let total = null;
+          let result_pct = null;
+          
+          for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
+            
+            // Trading pair detection (improved)
+            if (!pair && /^[A-Z]{2,6}[\/-]?(USDT|USD)?$/i.test(part)) {
+              pair = part.toUpperCase();
+              if (!pair.includes('/') && !pair.includes('-')) {
+                pair += '/USDT';
+              }
+              pair = pair.replace('-', '/');
+            }
+            
+            // Total amount detection (look for numbers > 50)
+            if (!total && /^\d{2,4}\.\d{2,6}$/.test(part)) {
+              const value = parseFloat(part);
+              if (value >= 50 && value <= 10000) {
+                total = value;
+              }
+            }
+            
+            // Result percentage detection
+            if (!result_pct && (/^[+-]?\d{1,2}\.\d{1,3}%?$/.test(part) || /^\d{1,2}\.\d{1,3}%$/.test(part))) {
+              result_pct = parseFloat(part.replace('%', ''));
+            }
+          }
+          
+          // Look in surrounding regions if data is incomplete
+          if (pair && (!total || result_pct === null)) {
+            console.log(`🔍 Looking for missing data around SELL region...`);
+            
+            // Check adjacent regions
+            const adjacentRegions = regions.filter(r => 
+              Math.abs(r.y - region.y) <= region.height * 2 && r !== region
+            );
+            
+            for (let adjRegion of adjacentRegions.slice(0, 3)) {
+              const adjResult = await processRegionWithOCR(document.createElement('canvas'), adjRegion, worker);
+              const adjParts = adjResult.text.split(/\s+/).filter(p => p.length > 0);
+              
+              for (let part of adjParts) {
+                if (!total && /^\d{2,4}\.\d{2,6}$/.test(part)) {
+                  const value = parseFloat(part);
+                  if (value >= 50 && value <= 10000) {
+                    total = value;
+                  }
+                }
+                
+                if (result_pct === null && /^[+-]?\d{1,2}\.\d{1,3}%?$/.test(part)) {
+                  result_pct = parseFloat(part.replace('%', ''));
+                }
+              }
+            }
+          }
+          
+          // Create trade if we have minimum required data
+          if (pair && total && result_pct !== null) {
+            const profit = (total * result_pct) / 100;
+            
+            const trade = {
+              id: Date.now() + Math.random(),
+              pair: pair,
+              total: total,
+              result: result_pct,
+              profit: profit,
+              confidence: result.confidence,
+              rawText: result.text
+            };
+            
+            console.log(`✅ Extracted trade:`, trade);
+            trades.push(trade);
+          } else {
+            console.log(`❌ Incomplete data - Pair: ${pair}, Total: ${total}, Result: ${result_pct}`);
+          }
+        }
+      } catch (error) {
+        console.error(`❌ Region processing error:`, error);
+      }
+    }
+    
+    return trades;
+  };
+
+  // Main processing function
+  const handleFileUpload = async (e) => {
     const files = Array.from(e.target.files || e.dataTransfer?.files || []);
     const imageFiles = files.filter(file => file.type.startsWith('image/'));
     
     if (imageFiles.length === 0) return;
 
-    // Convert files to preview URLs
+    setLoading(true);
+    setProgress({ current: 0, total: imageFiles.length, percent: 0 });
+    setProcessingLog(['🚀 Inicializace automatického skenování...']);
+    
+    // Create preview images
     const screenshotPreviews = [];
-    let processed = 0;
-    
-    imageFiles.forEach((file, index) => {
+    for (const file of imageFiles) {
       const reader = new FileReader();
-      reader.onload = (e) => {
-        screenshotPreviews[index] = {
-          id: Date.now() + index,
-          file,
-          preview: e.target.result,
-          name: file.name,
-          trades: []
-        };
-        processed++;
+      const dataUrl = await new Promise((resolve) => {
+        reader.onload = (e) => resolve(e.target.result);
+        reader.readAsDataURL(file);
+      });
+      screenshotPreviews.push({ file, preview: dataUrl, name: file.name });
+    }
+    setScreenshots(screenshotPreviews);
+    
+    const allTrades = [];
+    
+    try {
+      // Initialize OCR worker
+      setProcessingLog(prev => [...prev, '🔧 Načítání OCR engine...']);
+      const worker = await createWorker('eng', 1, { logger: () => {} });
+      
+      // Enhanced OCR settings for trading data
+      await worker.setParameters({
+        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-%/+:()[] ',
+        tessedit_pageseg_mode: '6',
+        tessedit_ocr_engine_mode: '1',
+        preserve_interword_spaces: '1'
+      });
+      
+      // Process each image
+      for (let i = 0; i < imageFiles.length; i++) {
+        setProgress(prev => ({ ...prev, current: i + 1 }));
+        setProcessingLog(prev => [...prev, `📷 Zpracovávám obrázek ${i + 1}/${imageFiles.length}: ${imageFiles[i].name}`]);
         
-        if (processed === imageFiles.length) {
-          // Sort by index to maintain order
-          const sortedScreenshots = screenshotPreviews.sort((a, b) => a.id - b.id);
-          setScreenshots(sortedScreenshots);
-          setCurrentScreenshot(0);
-          setManualEntry(prev => ({ ...prev, isActive: sortedScreenshots.length > 0 }));
-        }
-      };
-      reader.readAsDataURL(file);
-    });
-  };
-
-  // Add trade manually
-  const addTrade = () => {
-    const { pair, total, result } = manualEntry;
-    
-    if (!pair || !total || result === '') {
-      alert('Prosím vyplňte všechna pole');
-      return;
-    }
-
-    const numTotal = parseFloat(total);
-    const numResult = parseFloat(result);
-    const profit = (numTotal * numResult) / 100;
-
-    const newTrade = {
-      id: Date.now() + Math.random(),
-      pair: pair.toUpperCase(),
-      total: numTotal,
-      result: numResult,
-      profit: profit,
-      screenshot: currentScreenshot + 1
-    };
-
-    setTrades(prev => [...prev, newTrade]);
-    
-    // Clear form for next entry
-    setManualEntry(prev => ({
-      ...prev,
-      pair: '',
-      total: '',
-      result: ''
-    }));
-    
-    // Focus back to pair input for quick entry
-    setTimeout(() => {
-      document.getElementById('pairInput')?.focus();
-    }, 100);
-  };
-
-  // Quick add with Enter key
-  const handleKeyPress = (e, field) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      if (field === 'pair') {
-        document.getElementById('totalInput')?.focus();
-      } else if (field === 'total') {
-        document.getElementById('resultInput')?.focus();
-      } else if (field === 'result') {
-        addTrade();
+        // Load image to canvas
+        const img = new Image();
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        await new Promise((resolve) => {
+          img.onload = () => {
+            canvas.width = img.width;
+            canvas.height = img.height;
+            ctx.drawImage(img, 0, 0);
+            resolve();
+          };
+          img.src = screenshotPreviews[i].preview;
+        });
+        
+        setProcessingLog(prev => [...prev, `🔍 Detekuji oblasti tabulky...`]);
+        
+        // Detect trading table regions
+        const regions = await detectTradingRegions(canvas, ctx);
+        setProcessingLog(prev => [...prev, `📊 Nalezeno ${regions.length} oblastí k analýze`]);
+        
+        // Extract SELL transactions from regions
+        setProcessingLog(prev => [...prev, `⚡ Extrakce SELL transakcí...`]);
+        const imageTrades = await extractSellTransactions(regions, worker);
+        
+        setProcessingLog(prev => [...prev, `✅ Obrázek ${i + 1}: nalezeno ${imageTrades.length} SELL transakcí`]);
+        allTrades.push(...imageTrades);
+        
+        const percent = Math.round(((i + 1) / imageFiles.length) * 100);
+        setProgress(prev => ({ ...prev, percent }));
       }
-    }
-  };
-
-  // Smart auto-fill for common pairs
-  const handlePairChange = (value) => {
-    let formattedPair = value.toUpperCase();
-    
-    // Auto-add /USDT if not present
-    if (formattedPair && !formattedPair.includes('/') && !formattedPair.includes('-')) {
-      const commonPairs = ['SQR', 'ALGO', 'BONK', 'DOGE', 'SHIB', 'ETC', 'OP', 'BTC', 'ETH'];
-      if (commonPairs.some(pair => formattedPair.startsWith(pair))) {
-        formattedPair += '/USDT';
-      }
+      
+      await worker.terminate();
+      setProcessingLog(prev => [...prev, `🏆 Kompletní analýza dokončena: ${allTrades.length} transakcí celkem`]);
+      
+    } catch (error) {
+      console.error('Processing Error:', error);
+      setProcessingLog(prev => [...prev, `❌ Chyba: ${error.message}`]);
+    } finally {
+      setLoading(false);
+      setProgress({ current: 0, total: 0, percent: 0 });
     }
     
-    setManualEntry(prev => ({ ...prev, pair: formattedPair }));
-  };
-
-  // Navigation between screenshots
-  const nextScreenshot = () => {
-    if (currentScreenshot < screenshots.length - 1) {
-      setCurrentScreenshot(currentScreenshot + 1);
-    }
-  };
-
-  const prevScreenshot = () => {
-    if (currentScreenshot > 0) {
-      setCurrentScreenshot(currentScreenshot - 1);
-    }
-  };
-
-  // Delete trade
-  const deleteTrade = (id) => {
-    setTrades(prev => prev.filter(trade => trade.id !== id));
-  };
-
-  // Clear all
-  const clearAll = () => {
-    if (window.confirm('Vymazat všechny data a obrázky?')) {
-      setTrades([]);
-      setScreenshots([]);
-      setCurrentScreenshot(0);
-      setManualEntry({ pair: '', total: '', result: '', isActive: false });
-    }
+    setTrades(allTrades);
   };
 
   // Drag and drop handlers
@@ -159,7 +314,15 @@ const SellAnalyzer = () => {
     handleFileUpload(e);
   };
 
-  // Stats calculations
+  const clearAll = () => {
+    if (window.confirm('Vymazat všechny data a obrázky?')) {
+      setTrades([]);
+      setScreenshots([]);
+      setProcessingLog([]);
+    }
+  };
+
+  // Stats
   const totalProfit = trades.reduce((sum, trade) => sum + trade.profit, 0);
   const avgResult = trades.length > 0 ? trades.reduce((sum, trade) => sum + trade.result, 0) / trades.length : 0;
   const totalAmount = trades.reduce((sum, trade) => sum + trade.total, 0);
@@ -171,201 +334,107 @@ const SellAnalyzer = () => {
         {/* Header */}
         <div className="text-center mb-8">
           <h1 className="text-5xl font-bold mb-4 bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent">
-            ⚡ SELL Analyzer - Manual Pro
+            🤖 AI SELL Analyzer
           </h1>
           <p className="text-xl text-gray-300">
-            100% přesnost • Manual entry s live preview • Rychlé shortcuts
+            Automatické rozpoznávání • Template matching • Region-based OCR
           </p>
         </div>
 
         {/* Upload Section */}
-        {screenshots.length === 0 && (
-          <div className="bg-white/10 rounded-2xl p-8 mb-8 backdrop-blur-sm border border-white/20">
-            <div 
-              className="border-2 border-dashed border-red-500 rounded-xl p-16 text-center cursor-pointer transition-all duration-300 hover:border-red-400 hover:bg-red-900/10"
-              onDragOver={handleDragOver}
-              onDragLeave={handleDragLeave}
-              onDrop={handleDrop}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <div className="text-8xl mb-6">⚡📱⚡</div>
-              <h3 className="text-2xl font-semibold mb-4">Hybrid Manual + Visual Approach</h3>
-              <div className="bg-gradient-to-r from-green-900/50 to-blue-900/50 rounded-lg p-6 mb-4">
-                <p className="text-white font-semibold mb-3">⚡ 100% přesný workflow:</p>
-                <div className="text-left text-sm space-y-2">
-                  <div>1. 📷 Nahrajte screenshoty</div>
-                  <div>2. 👀 Prohlédněte si obrázek vedle formuláře</div>
-                  <div>3. ⌨️ Rychle zadejte data (Enter = další pole)</div>
-                  <div>4. 🚀 Instant přidání do tabulky</div>
+        <div className="bg-white/10 rounded-2xl p-8 mb-8 backdrop-blur-sm border border-white/20">
+          <div 
+            className="border-2 border-dashed border-red-500 rounded-xl p-16 text-center cursor-pointer transition-all duration-300 hover:border-red-400 hover:bg-red-900/10"
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            onClick={() => document.getElementById('fileInput').click()}
+          >
+            {loading ? (
+              <div className="space-y-6">
+                <div className="text-6xl animate-spin">🤖</div>
+                <h3 className="text-2xl font-semibold">
+                  AI analýza {progress.current}/{progress.total}...
+                </h3>
+                <div className="w-full bg-gray-700 rounded-full h-4">
+                  <div 
+                    className="bg-gradient-to-r from-red-500 to-red-600 h-4 rounded-full transition-all duration-300" 
+                    style={{ width: `${progress.percent}%` }}
+                  ></div>
+                </div>
+                <div className="text-lg">{progress.percent}% dokončeno</div>
+                
+                {/* Live Processing Log */}
+                <div className="bg-black/50 rounded-lg p-4 max-h-40 overflow-y-auto text-left">
+                  <div className="text-sm font-mono space-y-1">
+                    {processingLog.slice(-8).map((log, idx) => (
+                      <div key={idx} className="text-green-300">{log}</div>
+                    ))}
+                  </div>
                 </div>
               </div>
-              <p className="text-gray-300 text-lg mb-4">
-                <strong>Rychlé • Spolehlivé • Bez chyb OCR</strong>
-              </p>
-              <p className="text-gray-400">
-                Klikněte nebo přetáhněte více obrázků
-              </p>
-            </div>
+            ) : (
+              <div>
+                <div className="text-8xl mb-6">🤖📱🤖</div>
+                <h3 className="text-2xl font-semibold mb-4">Plně automatické rozpoznávání</h3>
+                <div className="bg-gradient-to-r from-purple-900/50 to-red-900/50 rounded-lg p-6 mb-4">
+                  <p className="text-white font-semibold mb-3">🧠 AI-powered workflow:</p>
+                  <div className="text-left text-sm space-y-2">
+                    <div>1. 🔍 Automatická detekce tabulkových oblastí</div>
+                    <div>2. 📊 Template matching pro SELL řádky</div>
+                    <div>3. ⚡ Region-based OCR na specifické oblasti</div>
+                    <div>4. 🎯 Inteligentní extrakce Pair | Total | Result | Profit</div>
+                  </div>
+                </div>
+                <p className="text-gray-300 text-lg mb-4">
+                  <strong>Nahrajte screenshoty a nechte AI pracovat</strong>
+                </p>
+                <p className="text-gray-400">
+                  Zero manual work • Maximum accuracy • Instant results
+                </p>
+              </div>
+            )}
             <input 
-              ref={fileInputRef}
               type="file" 
+              id="fileInput" 
               accept="image/*" 
               multiple
               onChange={handleFileUpload}
               className="hidden"
+              disabled={loading}
             />
           </div>
-        )}
-
-        {/* Manual Entry Interface */}
-        {screenshots.length > 0 && (
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 mb-8">
-            
-            {/* Screenshot Viewer */}
-            <div className="bg-white/10 rounded-2xl p-6 backdrop-blur-sm border border-white/20">
-              <div className="flex justify-between items-center mb-4">
-                <h3 className="text-xl font-semibold">
-                  📷 Screenshot {currentScreenshot + 1} / {screenshots.length}
-                </h3>
-                <div className="flex gap-2">
-                  <button 
-                    onClick={prevScreenshot}
-                    disabled={currentScreenshot === 0}
-                    className="px-3 py-1 bg-gray-600 rounded disabled:bg-gray-800 disabled:text-gray-500"
-                  >
-                    ◀ Prev
-                  </button>
-                  <button 
-                    onClick={nextScreenshot}
-                    disabled={currentScreenshot === screenshots.length - 1}
-                    className="px-3 py-1 bg-gray-600 rounded disabled:bg-gray-800 disabled:text-gray-500"
-                  >
-                    Next ▶
-                  </button>
-                </div>
-              </div>
-              
-              {screenshots[currentScreenshot] && (
-                <div className="relative">
-                  <img 
-                    src={screenshots[currentScreenshot].preview} 
-                    alt={`Screenshot ${currentScreenshot + 1}`}
-                    className="w-full max-h-[600px] object-contain rounded-lg border border-white/20"
-                  />
-                  <div className="absolute bottom-2 left-2 bg-black/70 px-3 py-1 rounded text-sm">
-                    {screenshots[currentScreenshot].name}
-                  </div>
-                </div>
-              )}
-              
-              {/* Quick navigation thumbnails */}
-              {screenshots.length > 1 && (
-                <div className="flex gap-2 mt-4 overflow-x-auto pb-2">
-                  {screenshots.map((screenshot, index) => (
-                    <img
-                      key={screenshot.id}
-                      src={screenshot.preview}
-                      alt={`Thumb ${index + 1}`}
-                      className={`w-16 h-16 object-cover rounded cursor-pointer border-2 transition-all ${
-                        index === currentScreenshot ? 'border-red-400' : 'border-gray-600 hover:border-red-300'
-                      }`}
-                      onClick={() => setCurrentScreenshot(index)}
+          
+          {/* Screenshots Preview */}
+          {screenshots.length > 0 && !loading && (
+            <div className="mt-8">
+              <h4 className="text-lg font-semibold mb-4 text-center">
+                🤖 AI zpracované obrázky ({screenshots.length})
+              </h4>
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                {screenshots.map((screenshot, index) => (
+                  <div key={index} className="relative group">
+                    <img 
+                      src={screenshot.preview} 
+                      alt={`Screenshot ${index + 1}`} 
+                      className="w-full h-32 object-cover rounded-lg border border-white/20 group-hover:scale-105 transition-transform"
                     />
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Manual Entry Form */}
-            <div className="bg-white/10 rounded-2xl p-6 backdrop-blur-sm border border-white/20">
-              <h3 className="text-xl font-semibold mb-4">⌨️ Rychlé zadávání SELL transakcí</h3>
-              
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-semibold mb-2 text-gray-300">
-                    🔗 Trading Pair
-                  </label>
-                  <input
-                    id="pairInput"
-                    type="text"
-                    placeholder="SQR, ALGO, BONK... (auto +/USDT)"
-                    value={manualEntry.pair}
-                    onChange={(e) => handlePairChange(e.target.value)}
-                    onKeyPress={(e) => handleKeyPress(e, 'pair')}
-                    className="w-full px-4 py-3 text-lg rounded-lg bg-white/10 border border-white/30 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-red-500 font-mono"
-                    autoFocus
-                  />
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-semibold mb-2 text-gray-300">
-                    💰 Total Amount (USDT)
-                  </label>
-                  <input
-                    id="totalInput"
-                    type="number"
-                    placeholder="274.1200"
-                    step="0.0001"
-                    value={manualEntry.total}
-                    onChange={(e) => setManualEntry(prev => ({ ...prev, total: e.target.value }))}
-                    onKeyPress={(e) => handleKeyPress(e, 'total')}
-                    className="w-full px-4 py-3 text-lg rounded-lg bg-white/10 border border-white/30 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
-                  />
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-semibold mb-2 text-gray-300">
-                    📊 Result Percentage (%)
-                  </label>
-                  <input
-                    id="resultInput"
-                    type="number"
-                    placeholder="6.26, -2.43, 1.55..."
-                    step="0.01"
-                    value={manualEntry.result}
-                    onChange={(e) => setManualEntry(prev => ({ ...prev, result: e.target.value }))}
-                    onKeyPress={(e) => handleKeyPress(e, 'result')}
-                    className="w-full px-4 py-3 text-lg rounded-lg bg-white/10 border border-white/30 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-green-500 font-mono"
-                  />
-                </div>
-                
-                {/* Live Profit Preview */}
-                {manualEntry.total && manualEntry.result && (
-                  <div className="bg-gradient-to-r from-purple-900/30 to-blue-900/30 rounded-lg p-4">
-                    <div className="text-center">
-                      <div className="text-sm text-gray-300">💎 Vypočítaný profit:</div>
-                      <div className={`text-2xl font-bold font-mono ${
-                        (parseFloat(manualEntry.total) * parseFloat(manualEntry.result)) / 100 >= 0 
-                          ? 'text-green-400' : 'text-red-400'
-                      }`}>
-                        {((parseFloat(manualEntry.total) || 0) * (parseFloat(manualEntry.result) || 0) / 100).toFixed(4)} USDT
-                      </div>
+                    <div className="absolute bottom-2 left-2 bg-black/70 text-xs px-2 py-1 rounded">
+                      AI #{index + 1}
                     </div>
                   </div>
-                )}
-                
-                <button
-                  onClick={addTrade}
-                  className="w-full px-6 py-4 bg-gradient-to-r from-red-500 to-red-600 rounded-lg font-bold text-lg hover:from-red-600 hover:to-red-700 transition-all duration-300 transform hover:scale-105"
-                >
-                  ➕ Přidat SELL transakci
-                </button>
-                
-                <div className="text-xs text-gray-400 text-center space-y-1">
-                  <div>💡 Tip: Použijte Enter pro rychlé přepínání mezi poli</div>
-                  <div>⌨️ Pair → Enter → Total → Enter → Result → Enter = Přidat</div>
-                </div>
+                ))}
               </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
 
         {/* Summary Stats */}
         {trades.length > 0 && (
           <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
             <div className="bg-gradient-to-r from-red-600 to-red-700 rounded-2xl p-6 text-center">
               <div className="text-4xl font-bold mb-2">{trades.length}</div>
-              <div className="text-red-100">SELL transakcí</div>
+              <div className="text-red-100">AI detekované SELL</div>
             </div>
             <div className="bg-gradient-to-r from-blue-600 to-blue-700 rounded-2xl p-6 text-center">
               <div className="text-4xl font-bold mb-2">{totalAmount.toFixed(2)}</div>
@@ -376,7 +445,7 @@ const SellAnalyzer = () => {
                 {totalProfit >= 0 ? '+' : ''}{totalProfit.toFixed(4)}
               </div>
               <div className={totalProfit >= 0 ? 'text-green-100' : 'text-red-100'}>
-                Celkový profit USDT
+                Celkový profit
               </div>
             </div>
             <div className={`bg-gradient-to-r ${avgResult >= 0 ? 'from-green-600 to-green-700' : 'from-red-600 to-red-700'} rounded-2xl p-6 text-center`}>
@@ -390,7 +459,7 @@ const SellAnalyzer = () => {
           </div>
         )}
 
-        {/* Action Buttons */}
+        {/* Action Button */}
         {trades.length > 0 && (
           <div className="flex justify-center gap-4 mb-8">
             <button
@@ -398,12 +467,6 @@ const SellAnalyzer = () => {
               className="px-6 py-3 bg-gradient-to-r from-red-600 to-red-700 rounded-lg font-semibold hover:from-red-700 hover:to-red-800 transition-all duration-300"
             >
               🗑️ Vymazat vše
-            </button>
-            <button
-              onClick={() => window.location.reload()}
-              className="px-6 py-3 bg-gradient-to-r from-gray-600 to-gray-700 rounded-lg font-semibold hover:from-gray-700 hover:to-gray-800 transition-all duration-300"
-            >
-              🔄 Nový projekt
             </button>
           </div>
         )}
@@ -413,43 +476,35 @@ const SellAnalyzer = () => {
           <div className="bg-white/10 rounded-2xl overflow-hidden backdrop-blur-sm border border-white/20 shadow-2xl">
             <div className="bg-gradient-to-r from-red-600 to-red-700 px-8 py-6">
               <h2 className="text-2xl font-bold text-center">
-                ⚡ SELL Transakce - 100% přesnost
+                🤖 AI Rozpoznané SELL Transakce
               </h2>
               <p className="text-center text-red-100 text-sm mt-2">
-                {screenshots.length} obrázků • {trades.length} manuálně zadaných transakcí
+                Automaticky extrahováno z {screenshots.length} obrázků
               </p>
             </div>
             
             {/* Desktop Table */}
             <div className="hidden md:block">
               <div className="bg-red-900/30 px-8 py-4 border-b border-white/10">
-                <div className="grid grid-cols-5 gap-6 font-bold text-xl">
+                <div className="grid grid-cols-4 gap-8 font-bold text-xl">
                   <div>🔗 Pair</div>
                   <div>💰 Total</div>
                   <div>📊 Result</div>
                   <div>💎 Profit</div>
-                  <div>🗑️</div>
                 </div>
               </div>
               <div className="divide-y divide-white/10">
                 {trades.map((trade) => (
                   <div key={trade.id} className="px-8 py-6 hover:bg-white/5 transition-colors">
-                    <div className="grid grid-cols-5 gap-6 items-center text-lg">
+                    <div className="grid grid-cols-4 gap-8 items-center text-lg">
                       <div className="font-bold text-red-400 text-xl">{trade.pair}</div>
-                      <div className="font-mono font-semibold text-lg">{trade.total.toFixed(4)}</div>
+                      <div className="font-mono font-semibold">{trade.total.toFixed(4)}</div>
                       <div className={`font-bold text-xl ${trade.result >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                         {trade.result >= 0 ? '+' : ''}{trade.result.toFixed(2)}%
                       </div>
                       <div className={`font-mono font-bold text-xl ${trade.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                         {trade.profit >= 0 ? '+' : ''}{trade.profit.toFixed(4)}
                       </div>
-                      <button
-                        onClick={() => deleteTrade(trade.id)}
-                        className="text-red-400 hover:text-red-300 transition-colors text-2xl"
-                        title="Smazat transakci"
-                      >
-                        ×
-                      </button>
                     </div>
                   </div>
                 ))}
@@ -459,30 +514,24 @@ const SellAnalyzer = () => {
             {/* Mobile Cards */}
             <div className="md:hidden p-4 space-y-4">
               {trades.map((trade) => (
-                <div key={trade.id} className="bg-white/5 rounded-xl p-6 border border-white/10 relative">
-                  <button
-                    onClick={() => deleteTrade(trade.id)}
-                    className="absolute top-3 right-3 text-red-400 hover:text-red-300 text-xl"
-                  >
-                    ×
-                  </button>
+                <div key={trade.id} className="bg-white/5 rounded-xl p-6 border border-white/10">
                   <div className="text-center mb-4">
                     <div className="font-bold text-2xl text-red-400">{trade.pair}</div>
                   </div>
                   <div className="space-y-3">
                     <div className="flex justify-between">
                       <span className="text-gray-300">💰 Total:</span>
-                      <span className="font-mono font-semibold text-lg">{trade.total.toFixed(4)}</span>
+                      <span className="font-mono font-semibold">{trade.total.toFixed(4)}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-300">📊 Result:</span>
-                      <span className={`font-bold text-lg ${trade.result >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      <span className={`font-bold ${trade.result >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                         {trade.result >= 0 ? '+' : ''}{trade.result.toFixed(2)}%
                       </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-300">💎 Profit:</span>
-                      <span className={`font-mono font-bold text-lg ${trade.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      <span className={`font-mono font-bold ${trade.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                         {trade.profit >= 0 ? '+' : ''}{trade.profit.toFixed(4)}
                       </span>
                     </div>
@@ -493,9 +542,29 @@ const SellAnalyzer = () => {
           </div>
         )}
 
+        {/* No results message */}
+        {!loading && trades.length === 0 && screenshots.length > 0 && (
+          <div className="bg-white/10 rounded-2xl p-12 text-center backdrop-blur-sm border border-white/20">
+            <div className="text-6xl mb-4">🤖</div>
+            <h3 className="text-2xl font-semibold mb-4">AI nedetekoval žádné SELL transakce</h3>
+            <p className="text-gray-300 text-lg mb-4">
+              Template matching nenašel odpovídající tabulkové struktury v {screenshots.length} obrázku{screenshots.length > 1 ? 'ch' : ''}
+            </p>
+            <div className="bg-yellow-900/30 rounded-lg p-4 max-w-lg mx-auto">
+              <p className="text-yellow-200 font-semibold">🤖 AI tips:</p>
+              <ul className="text-sm text-gray-300 mt-2 text-left">
+                <li>• Screenshot by měl obsahovat tabulku s trading daty</li>
+                <li>• Ujistěte se, že je viditelný text "Sell" nebo "SELL"</li>
+                <li>• Trading páry by měly být ve formátu XXX/USDT</li>
+                <li>• Zkuste screenshot s vyšším rozlišením</li>
+              </ul>
+            </div>
+          </div>
+        )}
+
         {/* Footer */}
         <div className="text-center mt-12 text-gray-400">
-          <p>⚡ Manual precision • Visual assistance • Keyboard shortcuts • Zero OCR errors</p>
+          <p>🤖 Powered by AI • Template matching • Region-based OCR • Zero manual work</p>
         </div>
       </div>
     </div>
