@@ -6,141 +6,74 @@ const SellAnalyzer = () => {
   const [screenshots, setScreenshots] = useState([]);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0, percent: 0 });
-  const [ocrResults, setOcrResults] = useState([]);
+  const [rawOcrData, setRawOcrData] = useState([]);
   const [showCorrection, setShowCorrection] = useState(false);
+  const [editingTrade, setEditingTrade] = useState(null);
 
-  // Aggressive image preprocessing for better OCR
-  const preprocessImage = (canvas, ctx, imageData) => {
-    const data = imageData.data;
-    const newCanvas = document.createElement('canvas');
-    const newCtx = newCanvas.getContext('2d');
-    newCanvas.width = canvas.width;
-    newCanvas.height = canvas.height;
-    
-    // Create multiple preprocessed versions
-    const versions = [];
-    
-    // Version 1: High contrast black/white
-    const version1Data = new Uint8ClampedArray(data);
-    for (let i = 0; i < version1Data.length; i += 4) {
-      const brightness = (version1Data[i] + version1Data[i + 1] + version1Data[i + 2]) / 3;
-      const isLight = brightness > 140;
-      version1Data[i] = isLight ? 255 : 0;
-      version1Data[i + 1] = isLight ? 255 : 0;
-      version1Data[i + 2] = isLight ? 255 : 0;
-    }
-    
-    // Version 2: Inverted (white text on black bg)
-    const version2Data = new Uint8ClampedArray(data);
-    for (let i = 0; i < version2Data.length; i += 4) {
-      version2Data[i] = 255 - version2Data[i];
-      version2Data[i + 1] = 255 - version2Data[i + 1];
-      version2Data[i + 2] = 255 - version2Data[i + 2];
-    }
-    
-    // Version 3: Enhanced contrast
-    const version3Data = new Uint8ClampedArray(data);
-    for (let i = 0; i < version3Data.length; i += 4) {
-      version3Data[i] = Math.min(255, version3Data[i] * 1.5);
-      version3Data[i + 1] = Math.min(255, version3Data[i + 1] * 1.5);
-      version3Data[i + 2] = Math.min(255, version3Data[i + 2] * 1.5);
-    }
-    
-    return [
-      { data: version1Data, name: 'High Contrast' },
-      { data: version2Data, name: 'Inverted' },
-      { data: version3Data, name: 'Enhanced' },
-      { data: data, name: 'Original' }
-    ];
-  };
-
-  // Enhanced SELL parsing with fuzzy matching
+  // Enhanced pattern matching with better Total detection
   const parseSellTransactions = (text, confidence, imageIndex) => {
     const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 1);
     const trades = [];
     
-    console.log(`🔍 OCR Text (confidence: ${confidence}%):`);
-    console.log(text.substring(0, 300));
-    
-    // Look for various SELL patterns
-    const sellPatterns = [
-      /sell/gi, /prodej/gi, /prodat/gi, /sold/gi, /sale/gi
-    ];
+    console.log(`🔍 OCR Text for image ${imageIndex + 1}:`);
+    console.log(text);
     
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].toLowerCase();
       
-      // Check if line contains any sell pattern
-      const hasSell = sellPatterns.some(pattern => pattern.test(line));
-      
-      if (hasSell) {
-        console.log(`💰 Potential SELL line: "${lines[i]}"`);
-        
-        // Get context (current line + surrounding lines)
-        const contextLines = [];
-        for (let j = Math.max(0, i - 2); j <= Math.min(lines.length - 1, i + 3); j++) {
-          contextLines.push(lines[j]);
-        }
+      if (line.includes('sell') || line.includes('prodej')) {
+        const contextStart = Math.max(0, i - 2);
+        const contextEnd = Math.min(lines.length, i + 3);
+        const contextLines = lines.slice(contextStart, contextEnd);
         const fullContext = contextLines.join(' ');
         
-        // Enhanced extraction patterns
+        console.log(`💰 SELL context: "${fullContext}"`);
+        
         let pair = null;
         let total = null;
         let result = null;
         
-        // Extract trading pair (more flexible)
-        const pairMatches = [
-          ...fullContext.matchAll(/([A-Z]{2,6})[\s\/\-]*(USDT|USD)/gi),
-          ...fullContext.matchAll(/(SQR|ALGO|BONK|DOGE|SHIB|ETC|OP|BTC|ETH|ADA|SOL|MATIC)[\/\-\s]*(USDT|USD)?/gi),
-          ...fullContext.matchAll(/([A-Z]{3,6})[\/\-\s]/gi)
-        ];
-        
-        if (pairMatches.length > 0) {
-          let foundPair = pairMatches[0][1];
-          if (pairMatches[0][2]) {
-            foundPair += '/' + pairMatches[0][2];
-          } else {
-            foundPair += '/USDT';
-          }
-          pair = foundPair.toUpperCase();
+        // Extract trading pair
+        const pairMatch = fullContext.match(/([A-Z]{2,6})[\s\/\-]*(USDT|USD)/i);
+        if (pairMatch) {
+          pair = `${pairMatch[1]}/${pairMatch[2] || 'USDT'}`.toUpperCase();
         }
         
-        // Extract total (look for realistic amounts)
-        const totalMatches = [...fullContext.matchAll(/(\d{2,4}\.?\d{0,8})/g)];
-        for (const match of totalMatches) {
+        // Enhanced Total extraction - look for realistic trading amounts
+        const numberMatches = [...fullContext.matchAll(/(\d+(?:\.\d+)?)/g)];
+        const potentialTotals = [];
+        
+        for (const match of numberMatches) {
           const value = parseFloat(match[1]);
-          if (value >= 10 && value <= 100000) {
-            total = value;
-            break;
+          // Filter for realistic trading amounts (exclude dates, small percentages)
+          if (value >= 50 && value <= 50000) {
+            potentialTotals.push(value);
           }
+        }
+        
+        // Choose the largest realistic number as Total (trading amounts are usually larger)
+        if (potentialTotals.length > 0) {
+          total = Math.max(...potentialTotals);
         }
         
         // Extract result percentage
-        const resultMatches = [
-          ...fullContext.matchAll(/([+-]?\d{1,3}\.?\d{0,3})\s*%/g),
-          ...fullContext.matchAll(/([+-]\d+\.?\d*)/g)
-        ];
-        
-        for (const match of resultMatches) {
-          const value = parseFloat(match[1]);
-          if (value >= -99 && value <= 99 && value !== 0) {
-            result = value;
-            break;
-          }
+        const resultMatch = fullContext.match(/([+-]?\d{1,2}\.?\d{0,3})\s*%/);
+        if (resultMatch) {
+          result = parseFloat(resultMatch[1]);
         }
         
-        // Create trade record
-        if (pair && total && result !== null) {
-          const profit = (total * result) / 100;
+        // Create trade with best guess - user can correct later
+        if (pair) {
           trades.push({
             id: Date.now() + Math.random(),
             pair,
-            total,
-            result,
-            profit,
+            total: total || 0, // Default to 0 if not found
+            result: result || 0, // Default to 0 if not found
+            profit: ((total || 0) * (result || 0)) / 100,
             source: `Image ${imageIndex + 1}`,
             confidence,
-            rawText: fullContext.substring(0, 100)
+            needsCorrection: !total || total < 50 || !result, // Flag suspicious data
+            rawContext: fullContext.substring(0, 150)
           });
         }
       }
@@ -149,7 +82,6 @@ const SellAnalyzer = () => {
     return trades;
   };
 
-  // Multi-attempt OCR with different preprocessing
   const handleFileUpload = async (e) => {
     const files = Array.from(e.target.files || e.dataTransfer?.files || []);
     const imageFiles = files.filter(file => file.type.startsWith('image/'));
@@ -158,9 +90,7 @@ const SellAnalyzer = () => {
 
     setLoading(true);
     setProgress({ current: 0, total: imageFiles.length, percent: 0 });
-    setOcrResults([]);
     
-    // Create previews
     const screenshotPreviews = [];
     for (const file of imageFiles) {
       const reader = new FileReader();
@@ -173,25 +103,25 @@ const SellAnalyzer = () => {
     setScreenshots(screenshotPreviews);
     
     const allTrades = [];
-    const allOcrResults = [];
+    const allRawData = [];
     
     try {
-      // Initialize OCR worker
-      const worker = await createWorker('eng+ces', 1, {
+      const worker = await createWorker('eng', 1, {
         logger: m => {
           if (m.status === 'recognizing text') {
-            setProgress(prev => ({ ...prev, percent: Math.round(m.progress * 50) }));
+            setProgress(prev => ({ ...prev, percent: Math.round(m.progress * 100) }));
           }
         }
       });
+
+      await worker.setParameters({
+        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-%/+:()[] ',
+        tessedit_pageseg_mode: '6',
+      });
       
-      // Process each image with multiple attempts
       for (let i = 0; i < imageFiles.length; i++) {
         setProgress(prev => ({ ...prev, current: i + 1 }));
         
-        console.log(`📷 Processing image ${i + 1}: ${imageFiles[i].name}`);
-        
-        // Load image
         const img = new Image();
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
@@ -206,55 +136,18 @@ const SellAnalyzer = () => {
           img.src = screenshotPreviews[i].preview;
         });
         
-        // Try multiple preprocessing versions
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const versions = preprocessImage(canvas, ctx, imageData);
+        const { data: { text, confidence } } = await worker.recognize(canvas);
         
-        let bestResult = null;
-        let bestTrades = [];
+        const trades = parseSellTransactions(text, confidence, i);
+        allTrades.push(...trades);
         
-        for (const version of versions) {
-          try {
-            // Apply preprocessing
-            const newImageData = new ImageData(version.data, canvas.width, canvas.height);
-            ctx.putImageData(newImageData, 0, 0);
-            
-            // Configure OCR for each attempt
-            await worker.setParameters({
-              tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-%/+:()[] ',
-              tessedit_pageseg_mode: '6',
-            });
-            
-            // OCR recognition
-            const { data: { text, confidence } } = await worker.recognize(canvas);
-            
-            console.log(`🎯 ${version.name} OCR confidence: ${confidence}%`);
-            
-            // Parse SELL transactions
-            const trades = parseSellTransactions(text, confidence, i);
-            
-            // Keep best result
-            if (trades.length > bestTrades.length || (trades.length === bestTrades.length && confidence > (bestResult?.confidence || 0))) {
-              bestResult = { text, confidence, version: version.name };
-              bestTrades = trades;
-            }
-            
-          } catch (error) {
-            console.error(`Error with ${version.name}:`, error);
-          }
-        }
-        
-        if (bestResult) {
-          allOcrResults.push({
-            image: i + 1,
-            ...bestResult,
-            trades: bestTrades,
-            preview: screenshotPreviews[i].preview
-          });
-          allTrades.push(...bestTrades);
-          
-          console.log(`✅ Best result for image ${i + 1}: ${bestTrades.length} trades (${bestResult.version}, ${bestResult.confidence}%)`);
-        }
+        allRawData.push({
+          imageIndex: i,
+          text,
+          confidence,
+          trades,
+          preview: screenshotPreviews[i].preview
+        });
         
         const percent = Math.round(((i + 1) / imageFiles.length) * 100);
         setProgress(prev => ({ ...prev, percent }));
@@ -264,19 +157,42 @@ const SellAnalyzer = () => {
       
     } catch (error) {
       console.error('OCR Error:', error);
-      alert(`Chyba při OCR: ${error.message}`);
     } finally {
       setLoading(false);
       setProgress({ current: 0, total: 0, percent: 0 });
     }
     
-    setOcrResults(allOcrResults);
+    setRawOcrData(allRawData);
     setTrades(allTrades);
+    setShowCorrection(true); // Always show correction interface
+  };
+
+  // Quick edit trade
+  const startEdit = (trade) => {
+    setEditingTrade({ ...trade });
+  };
+
+  const saveEdit = () => {
+    if (!editingTrade) return;
     
-    // Show correction interface if we have results
-    if (allOcrResults.length > 0) {
-      setShowCorrection(true);
-    }
+    const updatedTrade = {
+      ...editingTrade,
+      total: parseFloat(editingTrade.total) || 0,
+      result: parseFloat(editingTrade.result) || 0,
+      needsCorrection: false
+    };
+    updatedTrade.profit = (updatedTrade.total * updatedTrade.result) / 100;
+    
+    setTrades(prev => prev.map(t => t.id === updatedTrade.id ? updatedTrade : t));
+    setEditingTrade(null);
+  };
+
+  const cancelEdit = () => {
+    setEditingTrade(null);
+  };
+
+  const deleteTrade = (id) => {
+    setTrades(prev => prev.filter(t => t.id !== id));
   };
 
   const handleDragOver = (e) => {
@@ -298,14 +214,16 @@ const SellAnalyzer = () => {
   const clearAll = () => {
     setTrades([]);
     setScreenshots([]);
-    setOcrResults([]);
+    setRawOcrData([]);
     setShowCorrection(false);
+    setEditingTrade(null);
   };
 
   // Stats
   const totalProfit = trades.reduce((sum, trade) => sum + trade.profit, 0);
   const avgResult = trades.length > 0 ? trades.reduce((sum, trade) => sum + trade.result, 0) / trades.length : 0;
   const totalAmount = trades.reduce((sum, trade) => sum + trade.total, 0);
+  const needsCorrection = trades.filter(t => t.needsCorrection).length;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-red-900 to-indigo-900 text-white">
@@ -314,10 +232,10 @@ const SellAnalyzer = () => {
         {/* Header */}
         <div className="text-center mb-8">
           <h1 className="text-5xl font-bold mb-4 bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent">
-            🔥 Multi-OCR SELL Analyzer
+            ✏️ OCR + Smart Correction
           </h1>
           <p className="text-xl text-gray-300">
-            4x preprocessing • Multi-attempt OCR • Smart correction interface
+            OCR rozpoznání → Quick correction interface → Perfect data
           </p>
         </div>
 
@@ -332,9 +250,9 @@ const SellAnalyzer = () => {
           >
             {loading ? (
               <div className="space-y-6">
-                <div className="text-6xl animate-spin">🔥</div>
+                <div className="text-6xl animate-spin">✏️</div>
                 <h3 className="text-2xl font-semibold">
-                  Multi-OCR analýza {progress.current}/{progress.total}...
+                  OCR scanning {progress.current}/{progress.total}...
                 </h3>
                 <div className="w-full bg-gray-700 rounded-full h-4">
                   <div 
@@ -342,26 +260,26 @@ const SellAnalyzer = () => {
                     style={{ width: `${progress.percent}%` }}
                   ></div>
                 </div>
-                <div className="text-lg">{progress.percent}% - Zkouším různé preprocessing metody...</div>
+                <div className="text-lg">{progress.percent}% - Připravuji korekční rozhraní...</div>
               </div>
             ) : (
               <div>
-                <div className="text-8xl mb-6">🔥📱🔥</div>
-                <h3 className="text-2xl font-semibold mb-4">Robustní Multi-OCR Engine</h3>
-                <div className="bg-gradient-to-r from-orange-900/50 to-red-900/50 rounded-lg p-6 mb-4">
-                  <p className="text-white font-semibold mb-3">🔥 Multi-attempt approach:</p>
+                <div className="text-8xl mb-6">✏️📱✏️</div>
+                <h3 className="text-2xl font-semibold mb-4">OCR + Human Intelligence</h3>
+                <div className="bg-gradient-to-r from-blue-900/50 to-purple-900/50 rounded-lg p-6 mb-4">
+                  <p className="text-white font-semibold mb-3">✏️ Hybrid approach:</p>
                   <div className="text-left text-sm space-y-2">
-                    <div>1. 🎨 4x preprocessing: High contrast, Inverted, Enhanced, Original</div>
-                    <div>2. 🔄 Multiple OCR attempts na každý obrázek</div>
-                    <div>3. 🎯 Smart result comparison - vybere nejlepší</div>
-                    <div>4. ✏️ Quick correction interface pro rychlé opravy</div>
+                    <div>1. 🤖 OCR vyextrahuje co dokáže (páry, % už fungují)</div>
+                    <div>2. ⚠️ Označí podezřelá data (13 místo 274.1200)</div>
+                    <div>3. ✏️ Vy rychle opravíte wrong hodnoty</div>
+                    <div>4. ⚡ Instant přepočítání profit a statistik</div>
                   </div>
                 </div>
                 <p className="text-gray-300 text-lg mb-4">
-                  <strong>4x vyšší šance na úspěch než klasické OCR</strong>
+                  <strong>OCR rychlost + Human přesnost = Perfect solution</strong>
                 </p>
                 <p className="text-gray-400">
-                  Nahrajte screenshoty a nechte Multi-OCR pracovat
+                  Nahrajte screenshoty pro OCR + korekci
                 </p>
               </div>
             )}
@@ -377,45 +295,107 @@ const SellAnalyzer = () => {
           </div>
         </div>
 
-        {/* OCR Results & Correction Interface */}
-        {showCorrection && ocrResults.length > 0 && (
+        {/* Correction Interface */}
+        {showCorrection && trades.length > 0 && (
           <div className="bg-white/10 rounded-2xl p-6 mb-8 backdrop-blur-sm border border-white/20">
-            <div className="flex justify-between items-center mb-4">
-              <h3 className="text-xl font-semibold">🔍 OCR výsledky a korekce</h3>
+            <div className="flex justify-between items-center mb-6">
+              <div>
+                <h3 className="text-xl font-semibold">✏️ Quick Correction Interface</h3>
+                {needsCorrection > 0 && (
+                  <p className="text-yellow-400 text-sm">⚠️ {needsCorrection} transakcí potřebuje opravu</p>
+                )}
+              </div>
               <button 
                 onClick={() => setShowCorrection(false)}
-                className="px-4 py-2 bg-gray-600 rounded"
+                className="px-4 py-2 bg-gray-600 rounded hover:bg-gray-500"
               >
                 Skrýt
               </button>
             </div>
             
-            <div className="space-y-4 max-h-96 overflow-y-auto">
-              {ocrResults.map((result, idx) => (
-                <div key={idx} className="bg-white/5 rounded-lg p-4 border border-white/10">
-                  <div className="flex gap-4">
-                    <img 
-                      src={result.preview} 
-                      alt={`Result ${idx + 1}`}
-                      className="w-32 h-20 object-cover rounded"
-                    />
-                    <div className="flex-1">
-                      <div className="flex justify-between mb-2">
-                        <span className="font-semibold">Obrázek {result.image}</span>
-                        <span className="text-sm text-gray-400">
-                          {result.version} • {result.confidence}% • {result.trades.length} SELL
-                        </span>
+            <div className="space-y-4">
+              {trades.map((trade) => (
+                <div 
+                  key={trade.id} 
+                  className={`p-4 rounded-lg border ${
+                    trade.needsCorrection 
+                      ? 'bg-yellow-900/20 border-yellow-500' 
+                      : 'bg-white/5 border-white/10'
+                  }`}
+                >
+                  {editingTrade?.id === trade.id ? (
+                    // Edit mode
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-4 items-center">
+                      <input
+                        value={editingTrade.pair}
+                        onChange={(e) => setEditingTrade(prev => ({...prev, pair: e.target.value}))}
+                        className="px-3 py-2 bg-black/30 rounded border border-white/30 text-white"
+                        placeholder="SQR/USDT"
+                      />
+                      <input
+                        type="number"
+                        step="0.0001"
+                        value={editingTrade.total}
+                        onChange={(e) => setEditingTrade(prev => ({...prev, total: e.target.value}))}
+                        className="px-3 py-2 bg-black/30 rounded border border-white/30 text-white"
+                        placeholder="274.1200"
+                      />
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={editingTrade.result}
+                        onChange={(e) => setEditingTrade(prev => ({...prev, result: e.target.value}))}
+                        className="px-3 py-2 bg-black/30 rounded border border-white/30 text-white"
+                        placeholder="6.26"
+                      />
+                      <div className="text-green-400 font-mono">
+                        {((parseFloat(editingTrade.total) || 0) * (parseFloat(editingTrade.result) || 0) / 100).toFixed(4)}
                       </div>
-                      <div className="text-sm text-gray-300 bg-black/30 p-2 rounded font-mono max-h-20 overflow-y-auto">
-                        {result.text.substring(0, 200)}...
+                      <div className="flex gap-2">
+                        <button
+                          onClick={saveEdit}
+                          className="px-3 py-1 bg-green-600 rounded text-sm hover:bg-green-500"
+                        >
+                          ✓ Save
+                        </button>
+                        <button
+                          onClick={cancelEdit}
+                          className="px-3 py-1 bg-gray-600 rounded text-sm hover:bg-gray-500"
+                        >
+                          ✕ Cancel
+                        </button>
                       </div>
-                      {result.trades.length > 0 && (
-                        <div className="mt-2 text-sm">
-                          <strong>Rozpoznané SELL:</strong> {result.trades.map(t => `${t.pair} (${t.total}, ${t.result}%)`).join(', ')}
-                        </div>
-                      )}
                     </div>
-                  </div>
+                  ) : (
+                    // View mode
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-4 items-center">
+                      <div className="font-bold text-red-400">{trade.pair}</div>
+                      <div className={`font-mono ${trade.needsCorrection && trade.total < 50 ? 'text-yellow-400' : ''}`}>
+                        {trade.total.toFixed(4)}
+                        {trade.needsCorrection && trade.total < 50 && <span className="text-xs ml-1">⚠️</span>}
+                      </div>
+                      <div className={`font-bold ${trade.result >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {trade.result >= 0 ? '+' : ''}{trade.result.toFixed(2)}%
+                      </div>
+                      <div className={`font-mono font-bold ${trade.profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {trade.profit >= 0 ? '+' : ''}{trade.profit.toFixed(4)}
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => startEdit(trade)}
+                          className="px-3 py-1 bg-blue-600 rounded text-sm hover:bg-blue-500"
+                        >
+                          ✏️ Edit
+                        </button>
+                        <button
+                          onClick={() => deleteTrade(trade.id)}
+                          className="px-3 py-1 bg-red-600 rounded text-sm hover:bg-red-500"
+                        >
+                          🗑️
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -427,7 +407,7 @@ const SellAnalyzer = () => {
           <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
             <div className="bg-gradient-to-r from-red-600 to-red-700 rounded-2xl p-6 text-center">
               <div className="text-4xl font-bold mb-2">{trades.length}</div>
-              <div className="text-red-100">Multi-OCR SELL</div>
+              <div className="text-red-100">OCR + Corrected</div>
             </div>
             <div className="bg-gradient-to-r from-blue-600 to-blue-700 rounded-2xl p-6 text-center">
               <div className="text-4xl font-bold mb-2">{totalAmount.toFixed(2)}</div>
@@ -453,38 +433,35 @@ const SellAnalyzer = () => {
         )}
 
         {/* Action Buttons */}
-        {(trades.length > 0 || ocrResults.length > 0) && (
-          <div className="flex justify-center gap-4 mb-8">
+        <div className="flex justify-center gap-4 mb-8">
+          <button
+            onClick={clearAll}
+            className="px-6 py-3 bg-gradient-to-r from-red-600 to-red-700 rounded-lg font-semibold hover:from-red-700 hover:to-red-800 transition-all duration-300"
+          >
+            🗑️ Vymazat vše
+          </button>
+          {!showCorrection && trades.length > 0 && (
             <button
-              onClick={clearAll}
-              className="px-6 py-3 bg-gradient-to-r from-red-600 to-red-700 rounded-lg font-semibold hover:from-red-700 hover:to-red-800 transition-all duration-300"
+              onClick={() => setShowCorrection(true)}
+              className="px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-700 rounded-lg font-semibold hover:from-blue-700 hover:to-blue-800 transition-all duration-300"
             >
-              🗑️ Vymazat vše
+              ✏️ Zobrazit korekce
             </button>
-            {!showCorrection && ocrResults.length > 0 && (
-              <button
-                onClick={() => setShowCorrection(true)}
-                className="px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-700 rounded-lg font-semibold hover:from-blue-700 hover:to-blue-800 transition-all duration-300"
-              >
-                🔍 Zobrazit OCR detaily
-              </button>
-            )}
-          </div>
-        )}
+          )}
+        </div>
 
-        {/* Results Table */}
+        {/* Final Results Table */}
         {trades.length > 0 && (
           <div className="bg-white/10 rounded-2xl overflow-hidden backdrop-blur-sm border border-white/20 shadow-2xl">
             <div className="bg-gradient-to-r from-red-600 to-red-700 px-8 py-6">
               <h2 className="text-2xl font-bold text-center">
-                🔥 Multi-OCR Rozpoznané SELL Transakce
+                ✏️ Final Corrected SELL Transakce
               </h2>
               <p className="text-center text-red-100 text-sm mt-2">
-                Nejlepší výsledky z více OCR pokusů
+                OCR + Human correction = Perfect accuracy
               </p>
             </div>
             
-            {/* Desktop Table */}
             <div className="hidden md:block">
               <div className="bg-red-900/30 px-8 py-4 border-b border-white/10">
                 <div className="grid grid-cols-4 gap-8 font-bold text-xl">
@@ -512,13 +489,11 @@ const SellAnalyzer = () => {
               </div>
             </div>
 
-            {/* Mobile Cards */}
             <div className="md:hidden p-4 space-y-4">
               {trades.map((trade) => (
                 <div key={trade.id} className="bg-white/5 rounded-xl p-6 border border-white/10">
                   <div className="text-center mb-4">
                     <div className="font-bold text-2xl text-red-400">{trade.pair}</div>
-                    <div className="text-xs text-gray-400">Confidence: {trade.confidence}%</div>
                   </div>
                   <div className="space-y-3">
                     <div className="flex justify-between">
@@ -544,29 +519,9 @@ const SellAnalyzer = () => {
           </div>
         )}
 
-        {/* No results message */}
-        {!loading && trades.length === 0 && screenshots.length > 0 && (
-          <div className="bg-white/10 rounded-2xl p-12 text-center backdrop-blur-sm border border-white/20">
-            <div className="text-6xl mb-4">🔥</div>
-            <h3 className="text-2xl font-semibold mb-4">Multi-OCR nedetekoval žádné SELL transakce</h3>
-            <p className="text-gray-300 text-lg mb-4">
-              Ani po 4 různých preprocessing metodách nebyly nalezeny SELL transakce
-            </p>
-            <div className="bg-yellow-900/30 rounded-lg p-4 max-w-lg mx-auto">
-              <p className="text-yellow-200 font-semibold">💡 Zkuste:</p>
-              <ul className="text-sm text-gray-300 mt-2 text-left">
-                <li>• Screenshot s vyšším rozlišením nebo kontrastem</li>
-                <li>• Ujistěte se, že je viditelný text "Sell" nebo "SELL"</li>
-                <li>• Zobrazte si OCR detaily pro debug informace</li>
-                <li>• Jiný format screenshotu (PNG vs JPG)</li>
-              </ul>
-            </div>
-          </div>
-        )}
-
         {/* Footer */}
         <div className="text-center mt-12 text-gray-400">
-          <p>🔥 Multi-OCR Engine • 4x preprocessing • Smart result selection • Correction interface</p>
+          <p>✏️ OCR + Human Intelligence • Quick corrections • Perfect accuracy</p>
         </div>
       </div>
     </div>
